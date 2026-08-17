@@ -1615,6 +1615,13 @@ PROVIDER_CAPABILITIES = {
         "max_top_logprobs": 20,
         "has_cost_tracking": True,
     },
+    "atlascloud": {
+        "supports_logprobs": False,
+        "supports_streaming": True,
+        "supports_tools": True,
+        "max_top_logprobs": 0,
+        "has_cost_tracking": False,
+    },
     "groq": {
         "supports_logprobs": False,
         "supports_streaming": True,
