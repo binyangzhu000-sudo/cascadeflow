@@ -6,7 +6,7 @@
  */
 
 import { BaseProvider, type ProviderRequest, getHttpAgentOptions } from './base';
-import type { ProviderResponse, Tool, Message, ReasoningModelInfo } from '../types';
+import type { ProviderResponse, Tool, Message, ReasoningModelInfo, UsageDetails } from '../types';
 import type { ModelConfig } from '../config';
 import type { StreamChunk } from '../streaming';
 
@@ -27,11 +27,64 @@ try {
 type ChatCompletionMessageParam = any; // Simplified for MVP
 type ChatCompletionTool = any; // Simplified for MVP
 
+const KNOWLEDGE_CACHE_PREFIX_FIELD = '_cascadeflow_knowledge_cache_prefix';
+
+function usesExplicitPromptCacheBreakpoints(model: string): boolean {
+  const modelName = model.split('/').pop() ?? model;
+  const match = /^gpt-(\d+)(?:\.(\d+))?/i.exec(modelName);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major > 5 || (major === 5 && minor >= 6);
+}
+
+function prepareOpenAICacheExtra(
+  model: string,
+  extra: Record<string, any> | undefined,
+  messages: ChatCompletionMessageParam[]
+): Record<string, any> {
+  const providerExtra = { ...(extra ?? {}) };
+  const stablePrefix = providerExtra[KNOWLEDGE_CACHE_PREFIX_FIELD];
+  delete providerExtra[KNOWLEDGE_CACHE_PREFIX_FIELD];
+
+  if (typeof stablePrefix !== 'string' || !usesExplicitPromptCacheBreakpoints(model)) {
+    return providerExtra;
+  }
+
+  for (const message of messages) {
+    if (typeof message.content !== 'string') continue;
+    const start = message.content.indexOf(stablePrefix);
+    if (start < 0) continue;
+    const splitAt = start + stablePrefix.length;
+    message.content = [
+      {
+        type: 'text',
+        text: message.content.slice(0, splitAt),
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+      ...(message.content.slice(splitAt)
+        ? [{ type: 'text', text: message.content.slice(splitAt) }]
+        : []),
+    ];
+    // Avoid a billable implicit write for the changing latest user message.
+    providerExtra.prompt_cache_options = { mode: 'explicit' };
+    break;
+  }
+
+  return providerExtra;
+}
+
 /**
  * OpenAI pricing per 1K tokens (as of January 2025)
  * Source: https://openai.com/api/pricing/
  */
 const OPENAI_PRICING: Record<string, { input: number; output: number }> = {
+  // GPT-5.6 standard short-context pricing (August 2026)
+  'gpt-5.6-sol': { input: 0.005, output: 0.030 },
+  'gpt-5.6-terra': { input: 0.002, output: 0.012 },
+  'gpt-5.6-luna': { input: 0.0002, output: 0.0012 },
+  'gpt-5.6': { input: 0.005, output: 0.030 },
+
   // GPT-5 series (current flagship - released August 2025)
   // 50% cheaper input than GPT-4o, superior performance on coding, reasoning, math
   'gpt-5': { input: 0.00125, output: 0.010 },
@@ -219,6 +272,7 @@ export class OpenAIProvider extends BaseProvider {
       const tools = request.tools ? this.convertTools(request.tools) : undefined;
 
       const modelName = request.model || this.config.name;
+      const providerExtra = prepareOpenAICacheExtra(modelName, request.extra, chatMessages);
       // GPT-5 series doesn't support logprobs yet (as of January 2025)
       const supportsLogprobs = !modelName.startsWith('gpt-5');
       const isGpt5 = modelName.startsWith('gpt-5');
@@ -229,7 +283,7 @@ export class OpenAIProvider extends BaseProvider {
         messages: chatMessages,
         tools,
         stream: true,
-        ...request.extra,
+        ...providerExtra,
       };
 
       // GPT-5 only supports temperature=1 (default), doesn't allow custom values
@@ -321,6 +375,7 @@ export class OpenAIProvider extends BaseProvider {
       const tools = request.tools ? this.convertTools(request.tools) : undefined;
 
       const modelName = request.model || this.config.name;
+      const providerExtra = prepareOpenAICacheExtra(modelName, request.extra, chatMessages);
       // GPT-5 series doesn't support logprobs yet (as of January 2025)
       const supportsLogprobs = !modelName.startsWith('gpt-5');
       const isGpt5 = modelName.startsWith('gpt-5');
@@ -331,7 +386,7 @@ export class OpenAIProvider extends BaseProvider {
         messages: chatMessages,
         tools,
         stream: true,
-        ...request.extra,
+        ...providerExtra,
       };
 
       // GPT-5 only supports temperature=1 (default), doesn't allow custom values
@@ -473,6 +528,7 @@ export class OpenAIProvider extends BaseProvider {
         messages,
         modelInfo.supportsSystemMessages ? request.systemPrompt : undefined
       );
+      const providerExtra = prepareOpenAICacheExtra(modelName, request.extra, chatMessages);
 
       // If system prompt provided but not supported, prepend to first user message
       if (!modelInfo.supportsSystemMessages && request.systemPrompt) {
@@ -498,7 +554,7 @@ export class OpenAIProvider extends BaseProvider {
         model: modelName,
         messages: chatMessages,
         tools,
-        ...request.extra,
+        ...providerExtra,
       };
 
       // GPT-5 only supports temperature=1 (default), doesn't allow custom values
@@ -544,6 +600,10 @@ export class OpenAIProvider extends BaseProvider {
             prompt_tokens: completion.usage.prompt_tokens,
             completion_tokens: completion.usage.completion_tokens,
             total_tokens: completion.usage.total_tokens,
+            cached_input_tokens: completion.usage.prompt_tokens_details?.cached_tokens,
+            cache_write_input_tokens:
+              completion.usage.cache_write_tokens ??
+              (completion.usage.prompt_tokens_details as any)?.cache_write_tokens,
             reasoning_tokens: completion.usage.completion_tokens_details?.reasoning_tokens,
             completion_tokens_details: completion.usage.completion_tokens_details,
           }
@@ -580,6 +640,7 @@ export class OpenAIProvider extends BaseProvider {
       const tools = request.tools ? this.convertTools(request.tools) : undefined;
 
       const modelName = request.model || this.config.name;
+      const providerExtra = prepareOpenAICacheExtra(modelName, request.extra, chatMessages);
       // GPT-5 series doesn't support logprobs yet (as of January 2025)
       const supportsLogprobs = !modelName.startsWith('gpt-5');
       const isGpt5 = modelName.startsWith('gpt-5');
@@ -589,7 +650,7 @@ export class OpenAIProvider extends BaseProvider {
         model: modelName,
         messages: chatMessages,
         tools,
-        ...request.extra,
+        ...providerExtra,
       };
 
       // GPT-5 only supports temperature=1 (default), doesn't allow custom values
@@ -645,6 +706,10 @@ export class OpenAIProvider extends BaseProvider {
               prompt_tokens: completion.usage.prompt_tokens,
               completion_tokens: completion.usage.completion_tokens,
               total_tokens: completion.usage.total_tokens,
+              cached_input_tokens: completion.usage.prompt_tokens_details?.cached_tokens,
+              cache_write_input_tokens:
+                completion.usage.cache_write_tokens ??
+                completion.usage.prompt_tokens_details?.cache_write_tokens,
             }
           : undefined,
         finish_reason: choice.finish_reason,
@@ -679,34 +744,7 @@ export class OpenAIProvider extends BaseProvider {
     model: string,
     _reasoningTokens?: number
   ): number {
-    // Normalize model name to lowercase for case-insensitive matching
-    const modelLower = model.toLowerCase();
-
-    // Find model-specific pricing (exact match, case-insensitive)
-    let pricing = OPENAI_PRICING[modelLower];
-
-    // Try prefix matching for versioned models
-    // Match the LONGEST prefix to avoid "gpt-4o" matching "gpt-4o-mini"
-    if (!pricing) {
-      let longestMatch = '';
-      let longestMatchPricing = null;
-
-      for (const [key, value] of Object.entries(OPENAI_PRICING)) {
-        if (modelLower.startsWith(key) && key.length > longestMatch.length) {
-          longestMatch = key;
-          longestMatchPricing = value;
-        }
-      }
-
-      if (longestMatchPricing) {
-        pricing = longestMatchPricing;
-      }
-    }
-
-    // Fallback to gpt-4o-mini for unknown models
-    if (!pricing) {
-      pricing = OPENAI_PRICING['gpt-4o-mini'];
-    }
+    const pricing = this.getModelPricing(model);
 
     // Note: For o1/o3 models, reasoning tokens are already included in completion_tokens
     // from the API, so we don't need to add them separately. The API returns:
@@ -716,6 +754,48 @@ export class OpenAIProvider extends BaseProvider {
     const outputCost = (completionTokens / 1000) * pricing.output;
     const totalCost = inputCost + outputCost;
     return totalCost;
+  }
+
+  calculateCostFromUsage(usage: UsageDetails, model: string): number {
+    const pricing = this.getModelPricing(model);
+    const promptTokens = Math.max(usage.prompt_tokens ?? usage.input_tokens ?? 0, 0);
+    const completionTokens = Math.max(
+      usage.completion_tokens ?? usage.output_tokens ?? 0,
+      0
+    );
+    const cachedTokens = Math.min(Math.max(usage.cached_input_tokens ?? 0, 0), promptTokens);
+    const writeTokens = Math.min(
+      Math.max(usage.cache_write_input_tokens ?? 0, 0),
+      Math.max(promptTokens - cachedTokens, 0)
+    );
+
+    if (cachedTokens === 0 && writeTokens === 0) {
+      return this.calculateCost(promptTokens, completionTokens, model);
+    }
+
+    const uncachedTokens = Math.max(promptTokens - cachedTokens - writeTokens, 0);
+    const writeMultiplier = usesExplicitPromptCacheBreakpoints(model) ? 1.25 : 1.0;
+    const inputCost =
+      ((uncachedTokens + cachedTokens * 0.1 + writeTokens * writeMultiplier) / 1000) *
+      pricing.input;
+    const outputCost = (completionTokens / 1000) * pricing.output;
+    return inputCost + outputCost;
+  }
+
+  private getModelPricing(model: string): { input: number; output: number } {
+    const modelLower = model.toLowerCase().split('/').pop() ?? model.toLowerCase();
+    const exact = OPENAI_PRICING[modelLower];
+    if (exact) return exact;
+
+    let longestMatch = '';
+    let pricing: { input: number; output: number } | undefined;
+    for (const [key, value] of Object.entries(OPENAI_PRICING)) {
+      if (modelLower.startsWith(key) && key.length > longestMatch.length) {
+        longestMatch = key;
+        pricing = value;
+      }
+    }
+    return pricing ?? OPENAI_PRICING['gpt-4o-mini'];
   }
 
   /**

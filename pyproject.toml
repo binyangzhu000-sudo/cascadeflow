@@ -63,6 +63,7 @@ dependencies = [
 
 [project.scripts]
 cascadeflow-gateway = "cascadeflow.server:main"
+cascadeflow-mcp = "cascadeflow.mcp_server:main"
 
 [project.optional-dependencies]
 # Individual providers (API-based - require API keys)
@@ -120,6 +121,9 @@ google-adk = ["google-adk>=1.0.0; python_version >= '3.10'"]
 
 # PydanticAI integration (opt-in)
 pydantic-ai = ["pydantic-ai>=0.1.0; python_version >= '3.10'"]
+
+# Model Context Protocol server integration (opt-in; v1 FastMCP API)
+mcp = ["mcp>=1.27,<2; python_version >= '3.10'"]
 
 # Development tools (includes rich for terminal output)
 dev = [

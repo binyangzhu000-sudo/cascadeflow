@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Optional
@@ -10,6 +11,101 @@ import httpx
 
 from ..exceptions import ModelError, ProviderError
 from .base import BaseProvider, HttpConfig, ModelResponse, RetryConfig
+
+# Standard API pricing in USD per 1K tokens. GPT-5.6 rates are from the
+# 2026-08 OpenAI pricebook; older entries preserve CascadeFlow's existing rates.
+_OPENAI_PRICING: dict[str, dict[str, float]] = {
+    "gpt-5.6-sol": {"input": 0.005, "output": 0.030},
+    "gpt-5.6-terra": {"input": 0.002, "output": 0.012},
+    "gpt-5.6-luna": {"input": 0.0002, "output": 0.0012},
+    "gpt-5.6": {"input": 0.005, "output": 0.030},
+    "gpt-5-chat-latest": {"input": 0.00125, "output": 0.010},
+    "gpt-5-mini": {"input": 0.00025, "output": 0.002},
+    "gpt-5-nano": {"input": 0.00005, "output": 0.0004},
+    "gpt-5": {"input": 0.00125, "output": 0.010},
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "gpt-4o": {"input": 0.0025, "output": 0.010},
+    "o1-2024-12-17": {"input": 0.015, "output": 0.060},
+    "o1-preview": {"input": 0.015, "output": 0.060},
+    "o1-mini": {"input": 0.003, "output": 0.012},
+    "o1": {"input": 0.015, "output": 0.060},
+    "o3-mini": {"input": 0.001, "output": 0.005},
+    "gpt-4-turbo": {"input": 0.010, "output": 0.030},
+    "gpt-4": {"input": 0.030, "output": 0.060},
+    "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
+}
+
+
+def _openai_model_pricing(model: str) -> dict[str, float]:
+    """Return the longest-prefix price match for a versioned model name."""
+    model_lower = model.lower().rsplit("/", 1)[-1]
+    matches = [prefix for prefix in _OPENAI_PRICING if model_lower.startswith(prefix)]
+    if not matches:
+        return {"input": 0.030, "output": 0.060}
+    return _OPENAI_PRICING[max(matches, key=len)]
+
+
+def _cached_input_tokens(usage: dict[str, Any]) -> int:
+    details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    if not isinstance(details, dict):
+        return 0
+    return int(details.get("cached_tokens") or 0)
+
+
+def _cache_write_input_tokens(usage: dict[str, Any]) -> int:
+    """Return billable prompt-cache writes across current OpenAI response shapes."""
+    details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    detail_value = details.get("cache_write_tokens") if isinstance(details, dict) else 0
+    return int(usage.get("cache_write_tokens") or detail_value or 0)
+
+
+def _uses_explicit_prompt_cache_breakpoints(model: str) -> bool:
+    """GPT-5.6+ rejects the older implicit-prefix cost assumptions."""
+    model_name = (model or "").lower().rsplit("/", 1)[-1]
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?", model_name)
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= (5, 6)
+
+
+def _cache_content_blocks(text: str, stable_prefix: str, *, block_type: str) -> Optional[list]:
+    """Split text immediately after knowledge and mark that stable prefix."""
+    start = text.find(stable_prefix)
+    if start < 0:
+        return None
+    split_at = start + len(stable_prefix)
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": block_type,
+            "text": text[:split_at],
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        }
+    ]
+    if text[split_at:]:
+        blocks.append({"type": block_type, "text": text[split_at:]})
+    return blocks
+
+
+def _openai_usage_cost(
+    *, model: str, prompt_tokens: int, completion_tokens: int, usage: dict[str, Any]
+) -> float:
+    """Calculate cache-aware OpenAI cost from provider-reported token categories."""
+    pricing = _openai_model_pricing(model)
+    cached_tokens = min(_cached_input_tokens(usage), max(prompt_tokens, 0))
+    write_tokens = min(_cache_write_input_tokens(usage), max(prompt_tokens - cached_tokens, 0))
+    uncached_tokens = max(prompt_tokens - cached_tokens - write_tokens, 0)
+    write_multiplier = 1.25 if _uses_explicit_prompt_cache_breakpoints(model) else 1.0
+
+    input_cost = (
+        (uncached_tokens + (cached_tokens * 0.1) + (write_tokens * write_multiplier))
+        * pricing["input"]
+        / 1000
+    )
+    output_cost = max(completion_tokens, 0) * pricing["output"] / 1000
+    return input_cost + output_cost
+
 
 # ==============================================================================
 # REASONING MODEL SUPPORT
@@ -548,6 +644,77 @@ class OpenAIProvider(BaseProvider):
         instructions = "\n".join(instructions_parts).strip() if instructions_parts else ""
         return input_messages, instructions or None
 
+    def _apply_responses_cache_breakpoint(
+        self,
+        input_messages: list[dict[str, Any]],
+        instructions: Optional[str],
+        stable_prefix: Optional[str],
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        """Mark the stable knowledge prefix for GPT-5.6+ Responses requests."""
+        if not stable_prefix:
+            return input_messages, instructions
+
+        if instructions:
+            blocks = _cache_content_blocks(instructions, stable_prefix, block_type="input_text")
+            if blocks:
+                return [
+                    {"role": "developer", "content": blocks},
+                    *input_messages,
+                ], None
+
+        for index, message in enumerate(input_messages):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            blocks = _cache_content_blocks(content, stable_prefix, block_type="input_text")
+            if blocks:
+                updated = list(input_messages)
+                updated[index] = {**message, "content": blocks}
+                return updated, instructions
+        return input_messages, instructions
+
+    def _calculate_response_cost(
+        self,
+        *,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        usage: dict[str, Any],
+    ) -> float:
+        """Use cache categories when present, preserving LiteLLM otherwise."""
+        if _cached_input_tokens(usage) or _cache_write_input_tokens(usage):
+            return _openai_usage_cost(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                usage=usage,
+            )
+        return self.calculate_accurate_cost(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+
+    def _apply_chat_cache_breakpoint(
+        self,
+        messages: list[dict[str, Any]],
+        stable_prefix: Optional[str],
+    ) -> list[dict[str, Any]]:
+        """Mark the stable knowledge prefix for GPT-5.6+ Chat Completions."""
+        if not stable_prefix:
+            return messages
+        for index, message in enumerate(messages):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            blocks = _cache_content_blocks(content, stable_prefix, block_type="text")
+            if blocks:
+                updated = list(messages)
+                updated[index] = {**message, "content": blocks}
+                return updated
+        return messages
+
     def _parse_responses_output(
         self, data: dict[str, Any]
     ) -> tuple[str, Optional[list[dict[str, Any]]], str]:
@@ -735,6 +902,12 @@ class OpenAIProvider(BaseProvider):
         extra = dict(kwargs)
         extra.pop("max_tokens", None)
         extra.pop("max_completion_tokens", None)
+        stable_cache_prefix = extra.pop("_cascadeflow_knowledge_cache_prefix", None)
+        explicit_cache = bool(stable_cache_prefix) and _uses_explicit_prompt_cache_breakpoints(
+            model
+        )
+        if explicit_cache:
+            extra["prompt_cache_options"] = {"mode": "explicit"}
         extra_tool_choice = extra.pop("tool_choice", None)
         if tool_choice is None:
             tool_choice = extra_tool_choice
@@ -742,6 +915,10 @@ class OpenAIProvider(BaseProvider):
         # Prefer Responses API for GPT-5 (and optionally via env override).
         if self._should_use_responses_api(model):
             input_messages, instructions = self._convert_messages_to_responses_input(messages)
+            if explicit_cache:
+                input_messages, instructions = self._apply_responses_cache_breakpoint(
+                    input_messages, instructions, stable_cache_prefix
+                )
 
             max_out = self._effective_responses_max_output_tokens(model, max_tokens)
             payload: dict[str, Any] = {
@@ -793,11 +970,11 @@ class OpenAIProvider(BaseProvider):
 
                 latency_ms = (time.time() - start_time) * 1000
 
-                cost = self.calculate_accurate_cost(
+                cost = self._calculate_response_cost(
                     model=model,
                     prompt_tokens=int(prompt_tokens),
                     completion_tokens=int(completion_tokens),
-                    total_tokens=int(tokens_used),
+                    usage=usage,
                 )
 
                 if tool_calls:
@@ -819,6 +996,8 @@ class OpenAIProvider(BaseProvider):
                     "finish_reason": finish_reason,
                     "prompt_tokens": int(prompt_tokens),
                     "completion_tokens": int(completion_tokens),
+                    "cached_input_tokens": _cached_input_tokens(usage),
+                    "cache_write_input_tokens": _cache_write_input_tokens(usage),
                     "has_tool_calls": bool(tool_calls),
                     "confidence_method": confidence_method,
                     "tool_choice_reasoning": (
@@ -867,12 +1046,8 @@ class OpenAIProvider(BaseProvider):
         # Build request payload with reasoning-model compatibility
         model_info = get_reasoning_model_info(model)
         is_gpt5 = model.lower().startswith("gpt-5")
-        extra = dict(kwargs)
-        extra.pop("max_tokens", None)
-        extra.pop("max_completion_tokens", None)
-        extra_tool_choice = extra.pop("tool_choice", None)
-        if tool_choice is None:
-            tool_choice = extra_tool_choice
+        if explicit_cache:
+            messages = self._apply_chat_cache_breakpoint(messages, stable_cache_prefix)
 
         payload = {
             "model": model,
@@ -921,11 +1096,11 @@ class OpenAIProvider(BaseProvider):
             latency_ms = (time.time() - start_time) * 1000
 
             # Calculate cost (automatically uses LiteLLM if available)
-            cost = self.calculate_accurate_cost(
+            cost = self._calculate_response_cost(
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=tokens_used,
+                usage=data.get("usage") or {},
             )
 
             # Parse tool calls if present
@@ -961,6 +1136,8 @@ class OpenAIProvider(BaseProvider):
                 "finish_reason": choice["finish_reason"],
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "cached_input_tokens": _cached_input_tokens(data.get("usage") or {}),
+                "cache_write_input_tokens": _cache_write_input_tokens(data.get("usage") or {}),
                 "has_tool_calls": bool(tool_calls),
                 "confidence_method": confidence_method,  # ← NEW!
                 "tool_choice_reasoning": (
@@ -1052,6 +1229,14 @@ class OpenAIProvider(BaseProvider):
         # Extract logprobs parameters
         logprobs_enabled = kwargs.pop("logprobs", False)
         top_logprobs = kwargs.pop("top_logprobs", 5)  # Default to 5
+        stable_cache_prefix = kwargs.pop("_cascadeflow_knowledge_cache_prefix", None)
+        explicit_cache = bool(stable_cache_prefix) and _uses_explicit_prompt_cache_breakpoints(
+            model
+        )
+        if explicit_cache:
+            # Disable the implicit latest-message write. Otherwise each changing
+            # query can create a new billable GPT-5.6 cache entry.
+            kwargs["prompt_cache_options"] = {"mode": "explicit"}
 
         # Get reasoning model info for auto-configuration
         model_info = get_reasoning_model_info(model)
@@ -1065,6 +1250,9 @@ class OpenAIProvider(BaseProvider):
                 # Prepend system prompt to first user message
                 prompt = f"{system_prompt}\n\n{prompt}"
         messages.append({"role": "user", "content": prompt})
+        uses_responses_api = self._should_use_responses_api(model)
+        if explicit_cache and not uses_responses_api:
+            messages = self._apply_chat_cache_breakpoint(messages, stable_cache_prefix)
 
         # Check if this is GPT-5 model for correct token parameter
         is_gpt5 = model.lower().startswith("gpt-5")
@@ -1099,8 +1287,12 @@ class OpenAIProvider(BaseProvider):
                 payload["top_logprobs"] = min(top_logprobs, 20)  # OpenAI max is 20
 
         try:
-            if self._should_use_responses_api(model):
+            if uses_responses_api:
                 input_messages, instructions = self._convert_messages_to_responses_input(messages)
+                if explicit_cache:
+                    input_messages, instructions = self._apply_responses_cache_breakpoint(
+                        input_messages, instructions, stable_cache_prefix
+                    )
                 max_out = self._effective_responses_max_output_tokens(model, max_tokens)
                 responses_payload: dict[str, Any] = {
                     "model": model,
@@ -1111,6 +1303,13 @@ class OpenAIProvider(BaseProvider):
                     responses_payload["instructions"] = instructions
                 if model_info.supports_temperature:
                     responses_payload["temperature"] = temperature
+                for cache_field in (
+                    "prompt_cache_key",
+                    "prompt_cache_retention",
+                    "prompt_cache_options",
+                ):
+                    if cache_field in payload:
+                        responses_payload[cache_field] = payload[cache_field]
 
                 response = await self.client.post(
                     f"{self.base_url}/responses", json=responses_payload
@@ -1145,11 +1344,11 @@ class OpenAIProvider(BaseProvider):
 
                 latency_ms = (time.time() - start_time) * 1000
 
-                cost = self.estimate_cost(
-                    tokens_used,
-                    model,
+                cost = self._calculate_response_cost(
+                    model=model,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    usage=usage,
                 )
 
                 metadata_for_confidence = {
@@ -1182,6 +1381,8 @@ class OpenAIProvider(BaseProvider):
                     "finish_reason": finish_reason,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    "cached_input_tokens": _cached_input_tokens(usage),
+                    "cache_write_input_tokens": _cache_write_input_tokens(usage),
                     "query": prompt,
                     "confidence_method": confidence_method,
                     "confidence_components": confidence_components,
@@ -1224,8 +1425,11 @@ class OpenAIProvider(BaseProvider):
             latency_ms = (time.time() - start_time) * 1000
 
             # Calculate accurate cost using input/output split
-            cost = self.estimate_cost(
-                tokens_used, model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+            cost = self._calculate_response_cost(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                usage=data.get("usage") or {},
             )
 
             # ============================================================
@@ -1311,6 +1515,8 @@ class OpenAIProvider(BaseProvider):
                 "finish_reason": choice["finish_reason"],
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "cached_input_tokens": _cached_input_tokens(data.get("usage") or {}),
+                "cache_write_input_tokens": _cache_write_input_tokens(data.get("usage") or {}),
                 # NEW: Add confidence analysis details for test validation
                 "query": prompt,
                 "confidence_method": confidence_method,
@@ -1416,6 +1622,13 @@ class OpenAIProvider(BaseProvider):
             ...     print(chunk, end='', flush=True)
             Python is a high-level programming language...
         """
+        stable_cache_prefix = kwargs.pop("_cascadeflow_knowledge_cache_prefix", None)
+        explicit_cache = bool(stable_cache_prefix) and _uses_explicit_prompt_cache_breakpoints(
+            model
+        )
+        if explicit_cache:
+            kwargs["prompt_cache_options"] = {"mode": "explicit"}
+
         # Build messages
         messages = []
         if system_prompt:
@@ -1432,6 +1645,10 @@ class OpenAIProvider(BaseProvider):
 
         if self._should_use_responses_api(model):
             input_messages, instructions = self._convert_messages_to_responses_input(messages)
+            if explicit_cache:
+                input_messages, instructions = self._apply_responses_cache_breakpoint(
+                    input_messages, instructions, stable_cache_prefix
+                )
             payload: dict[str, Any] = {
                 "model": model,
                 "input": input_messages,
@@ -1511,6 +1728,8 @@ class OpenAIProvider(BaseProvider):
                 )
 
         # Default: Chat Completions streaming.
+        if explicit_cache:
+            messages = self._apply_chat_cache_breakpoint(messages, stable_cache_prefix)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -1606,43 +1825,7 @@ class OpenAIProvider(BaseProvider):
         Returns:
             Estimated cost in USD
         """
-        # OpenAI pricing per 1K tokens (as of January 2025)
-        # Source: https://openai.com/api/pricing/
-        pricing = {
-            # GPT-5 series (current flagship - released August 2025)
-            # 50% cheaper input than GPT-4o, superior performance on coding, reasoning, math
-            "gpt-5": {"input": 0.00125, "output": 0.010},
-            "gpt-5-mini": {"input": 0.00025, "output": 0.002},
-            "gpt-5-nano": {"input": 0.00005, "output": 0.0004},
-            "gpt-5-chat-latest": {"input": 0.00125, "output": 0.010},
-            # GPT-4o series (previous flagship)
-            "gpt-4o": {"input": 0.0025, "output": 0.010},
-            "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-            # O1 series (reasoning models)
-            "o1-preview": {"input": 0.015, "output": 0.060},
-            "o1-mini": {"input": 0.003, "output": 0.012},
-            "o1": {"input": 0.015, "output": 0.060},
-            "o1-2024-12-17": {"input": 0.015, "output": 0.060},
-            # O3 series (reasoning models)
-            "o3-mini": {"input": 0.001, "output": 0.005},
-            # GPT-4 series (previous generation)
-            "gpt-4-turbo": {"input": 0.010, "output": 0.030},
-            "gpt-4": {"input": 0.030, "output": 0.060},
-            # GPT-3.5 series (deprecated - use gpt-4o-mini instead)
-            "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
-        }
-
-        # Find model pricing
-        model_pricing = None
-        model_lower = model.lower()
-        for prefix, rates in pricing.items():
-            if model_lower.startswith(prefix):
-                model_pricing = rates
-                break
-
-        # Default to GPT-4 pricing if unknown
-        if not model_pricing:
-            model_pricing = {"input": 0.030, "output": 0.060}
+        model_pricing = _openai_model_pricing(model)
 
         # Calculate accurate cost if we have the split
         if prompt_tokens is not None and completion_tokens is not None:

@@ -112,12 +112,14 @@ class ModelConfig(BaseModel):
             "openai",
             "atlascloud",
             "anthropic",
+            "deepseek",
             "groq",
             "ollama",
             "huggingface",
             "together",
             "vllm",
             "replicate",
+            "openrouter",
             "custom",
         ]
         if v not in allowed:

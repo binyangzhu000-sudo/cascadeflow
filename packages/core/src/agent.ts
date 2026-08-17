@@ -2,7 +2,7 @@
  * cascadeflow Agent - MVP Implementation
  */
 
-import { providerRegistry, getAvailableProviders } from './providers/base';
+import { providerRegistry, getAvailableProviders, type Provider } from './providers/base';
 import { OpenAIProvider } from './providers/openai';
 import { AnthropicProvider } from './providers/anthropic';
 import { GroqProvider } from './providers/groq';
@@ -14,7 +14,7 @@ import { OpenRouterProvider } from './providers/openrouter';
 import { VercelAISDKProvider, VERCEL_AI_PROVIDER_NAMES } from './providers/vercel-ai';
 import type { AgentConfig, ModelConfig } from './config';
 import type { CascadeResult } from './result';
-import type { Message, Tool, UserProfile, TierLevel } from './types';
+import type { Message, Tool, UserProfile, TierLevel, ProviderResponse } from './types';
 import { ToolCall as ParsedToolCall, ToolExecutor } from './tools';
 import {
   type StreamEvent,
@@ -41,6 +41,12 @@ import { CallbackEvent } from './telemetry/callbacks';
 import type { DomainConfig, DomainConfigMap } from './config/domain-config';
 import { RuleEngine } from './rules';
 import type { RuleContext, RuleDecision } from './rules';
+import {
+  KnowledgeCache,
+  providerKnowledgeCacheOptions,
+  type KnowledgeSnapshot,
+  type PreparedKnowledge,
+} from './knowledge-cache';
 
 // Register providers
 providerRegistry.register('openai', OpenAIProvider);
@@ -97,6 +103,9 @@ export interface RunOptions {
 
   /** System prompt */
   systemPrompt?: string;
+
+  /** Immutable request-scoped knowledge used by every routed model. */
+  knowledge?: string | KnowledgeSnapshot;
 
   /** Tools/functions available */
   tools?: Tool[];
@@ -169,6 +178,29 @@ export class CascadeAgent {
   private enableDomainDetection: boolean;
   private ruleEngine: RuleEngine;
   private toolExecutor?: ToolExecutor;
+  private knowledgeCache = new KnowledgeCache();
+
+  private providerExtra(
+    extra: Record<string, any> | undefined,
+    provider: string,
+    prepared?: PreparedKnowledge
+  ): Record<string, any> | undefined {
+    const cacheOptions = providerKnowledgeCacheOptions(provider, prepared);
+    if (!extra && Object.keys(cacheOptions).length === 0) return undefined;
+    return { ...(extra ?? {}), ...cacheOptions };
+  }
+
+  private responseCost(provider: Provider, response: ProviderResponse): number {
+    if (!response.usage) return 0;
+    if (provider.calculateCostFromUsage) {
+      return provider.calculateCostFromUsage(response.usage, response.model);
+    }
+    return provider.calculateCost(
+      response.usage.prompt_tokens,
+      response.usage.completion_tokens,
+      response.model
+    );
+  }
 
   /**
    * Create a new cascadeflow agent
@@ -735,7 +767,13 @@ export class CascadeAgent {
 
     const rawMessages: Message[] =
       typeof input === 'string' ? [{ role: 'user', content: input }] : input;
-    const normalized = normalizeSystemPromptFromMessages(rawMessages, options.systemPrompt);
+    const preparedKnowledge = options.knowledge
+      ? this.knowledgeCache.prepare(options.knowledge).prepared
+      : undefined;
+    const stableSystemPrompt = preparedKnowledge
+      ? [preparedKnowledge.systemPrefix, options.systemPrompt].filter(Boolean).join('\n\n')
+      : options.systemPrompt;
+    const normalized = normalizeSystemPromptFromMessages(rawMessages, stableSystemPrompt);
     const messages = normalized.messages;
     const executor = options.toolExecutor ?? this.toolExecutor;
     if (executor && typeof (executor as any).executeParallel !== 'function') {
@@ -914,7 +952,7 @@ export class CascadeAgent {
               temperature: options.temperature,
               systemPrompt: normalized.systemPrompt,
               tools: options.tools,
-              extra: options.extra,
+              extra: this.providerExtra(options.extra, bestModelConfig.provider, preparedKnowledge),
             });
 
             modelUsed = response.model;
@@ -922,11 +960,7 @@ export class CascadeAgent {
             finalToolCalls = response.tool_calls;
 
             if (response.usage) {
-              totalLoopCost += provider.calculateCost(
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                response.model
-              );
+              totalLoopCost += this.responseCost(provider, response);
             }
 
             const assistantMsg: Message = { role: 'assistant', content: response.content || '' };
@@ -991,7 +1025,7 @@ export class CascadeAgent {
           temperature: options.temperature,
           systemPrompt: normalized.systemPrompt,
           tools: options.tools,
-          extra: options.extra,
+          extra: this.providerExtra(options.extra, bestModelConfig.provider, preparedKnowledge),
         });
 
         modelUsed = response.model;
@@ -1000,11 +1034,7 @@ export class CascadeAgent {
 
         // Calculate cost
         if (response.usage) {
-          totalCost = provider.calculateCost(
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
-            response.model
-          );
+          totalCost = this.responseCost(provider, response);
         }
 
         const latencyMs = Date.now() - startTime;
@@ -1051,7 +1081,7 @@ export class CascadeAgent {
         temperature: options.temperature,
         systemPrompt: normalized.systemPrompt,
         tools: options.tools,
-        extra: options.extra,
+        extra: this.providerExtra(options.extra, draftModelConfig.provider, preparedKnowledge),
       });
 
       draftLatency = Date.now() - draftStart;
@@ -1062,11 +1092,7 @@ export class CascadeAgent {
 
       // Calculate draft cost
       if (draftResponse.usage) {
-        draftCost = draftProvider.calculateCost(
-          draftResponse.usage.prompt_tokens,
-          draftResponse.usage.completion_tokens,
-          draftResponse.model
-        );
+        draftCost = this.responseCost(draftProvider, draftResponse);
       }
 
       // Quality validation using logprobs and heuristics
@@ -1141,7 +1167,7 @@ export class CascadeAgent {
         temperature: options.temperature,
         systemPrompt: normalized.systemPrompt,
         tools: options.tools,
-        extra: options.extra,
+        extra: this.providerExtra(options.extra, verifierModelConfig.provider, preparedKnowledge),
       });
 
         verifierLatency = Date.now() - verifierStart;
@@ -1152,11 +1178,7 @@ export class CascadeAgent {
 
         // Calculate verifier cost
         if (verifierResponse.usage) {
-          verifierCost = verifierProvider.calculateCost(
-            verifierResponse.usage.prompt_tokens,
-            verifierResponse.usage.completion_tokens,
-            verifierResponse.model
-          );
+          verifierCost = this.responseCost(verifierProvider, verifierResponse);
         }
       } else {
         draftAccepted = true;
@@ -1327,7 +1349,13 @@ export class CascadeAgent {
 
     const rawMessages: Message[] =
       typeof input === 'string' ? [{ role: 'user', content: input }] : input;
-    const normalized = normalizeSystemPromptFromMessages(rawMessages, options.systemPrompt);
+    const preparedKnowledge = options.knowledge
+      ? this.knowledgeCache.prepare(options.knowledge).prepared
+      : undefined;
+    const stableSystemPrompt = preparedKnowledge
+      ? [preparedKnowledge.systemPrefix, options.systemPrompt].filter(Boolean).join('\n\n')
+      : options.systemPrompt;
+    const normalized = normalizeSystemPromptFromMessages(rawMessages, stableSystemPrompt);
     const messages = normalized.messages;
 
     // Extract query text for complexity detection (exclude system messages)
@@ -1481,19 +1509,20 @@ export class CascadeAgent {
 
         if (!directProvider.stream) {
           // Fallback to non-streaming path
-        const result = await this.run(input, {
-          maxTokens: maxTokens,
-          temperature: options.temperature,
-          systemPrompt: normalized.systemPrompt,
-          tools: options.tools,
-          extra: options.extra,
-          forceDirect: true,
-          userTier: options.userTier,
-          workflow: options.workflow,
-          kpiFlags: options.kpiFlags,
-          tenantId: options.tenantId,
-          channel: options.channel,
-        });
+          const result = await this.run(input, {
+            maxTokens: maxTokens,
+            temperature: options.temperature,
+            systemPrompt: options.systemPrompt,
+            knowledge: options.knowledge,
+            tools: options.tools,
+            extra: options.extra,
+            forceDirect: true,
+            userTier: options.userTier,
+            workflow: options.workflow,
+            kpiFlags: options.kpiFlags,
+            tenantId: options.tenantId,
+            channel: options.channel,
+          });
           yield createStreamEvent(StreamEventType.CHUNK, result.content, {
             model: result.modelUsed,
             phase: 'direct',
@@ -1514,7 +1543,7 @@ export class CascadeAgent {
           temperature: options.temperature,
           systemPrompt: normalized.systemPrompt,
           tools: options.tools,
-          extra: options.extra,
+          extra: this.providerExtra(options.extra, bestModelConfig.provider, preparedKnowledge),
         })) {
           directContent += chunk.content;
 
@@ -1595,7 +1624,7 @@ export class CascadeAgent {
         temperature: options.temperature,
         systemPrompt: normalized.systemPrompt,
         tools: options.tools,
-        extra: options.extra,
+        extra: this.providerExtra(options.extra, draftModelConfig.provider, preparedKnowledge),
       })) {
         draftContent += chunk.content;
 
@@ -1737,7 +1766,7 @@ export class CascadeAgent {
             temperature: options.temperature,
             systemPrompt: normalized.systemPrompt,
             tools: options.tools,
-            extra: options.extra,
+            extra: this.providerExtra(options.extra, verifierModelConfig.provider, preparedKnowledge),
           })) {
             verifierContent += chunk.content;
 
@@ -1770,7 +1799,7 @@ export class CascadeAgent {
             temperature: options.temperature,
             systemPrompt: normalized.systemPrompt,
             tools: options.tools,
-            extra: options.extra,
+            extra: this.providerExtra(options.extra, verifierModelConfig.provider, preparedKnowledge),
           });
           verifierContent = verifierResponse.content;
           verifierToolCalls = verifierResponse.tool_calls;
